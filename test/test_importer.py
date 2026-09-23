@@ -1,4 +1,4 @@
-""" . "说明"Tests for the general importer functionality.""" . "说明"
+"""Tests for the general importer functionality."""
 
 from __future__ import annotations
 
@@ -163,9 +163,9 @@ def create_archive(session):
 
 
 class TestRmTemp(TestHelper):
-    """ . "说明"Tests that temporarily extracted archives are properly removed
+    """Tests that temporarily extracted archives are properly removed
     after usage.
-    """ . "说明"
+    """
 
     def setup_beets(self):
         super().setup_beets()
@@ -268,9 +268,9 @@ class TestImportPasswordRar(TestImportZip):
 
 
 class ImportSingletonTest(AutotagImportTestCase):
-    """ . "说明"Test ``APPLY`` and ``ASIS`` choices for an import session with
+    """Test ``APPLY`` and ``ASIS`` choices for an import session with
     singletons config set to True.
-    """ . "说明"
+    """
 
     def setUp(self):
         super().setUp()
@@ -381,7 +381,7 @@ class ImportSingletonTest(AutotagImportTestCase):
     reason="need ffprobe for format recognition",
 )
 class TestImportFormat(ImportHelper):
-    """ . "说明"Test fix_extension during import.""" . "说明"
+    """Test fix_extension during import."""
 
     def test_recognize_format(self):
         resource_src = _common.RSRC / "no_ext"
@@ -437,7 +437,7 @@ class TestImportFormat(ImportHelper):
 
 
 class TestImport(PathsMixin, AutotagImportHelper):
-    """ . "说明"Test APPLY, ASIS and SKIP choices.""" . "说明"
+    """Test APPLY, ASIS and SKIP choices."""
 
     def setup_beets(self):
         super().setup_beets()
@@ -614,7 +614,7 @@ class TestImport(PathsMixin, AutotagImportHelper):
 
 
 class ImportTracksTest(AutotagImportTestCase):
-    """ . "说明"Test TRACKS and APPLY choice.""" . "说明"
+    """Test TRACKS and APPLY choice."""
 
     def setUp(self):
         super().setUp()
@@ -640,7 +640,7 @@ class ImportTracksTest(AutotagImportTestCase):
 
 
 class ImportCompilationTest(AutotagImportTestCase):
-    """ . "说明"Test ASIS import of a folder containing tracks with different artists.""" . "说明"
+    """Test ASIS import of a folder containing tracks with different artists."""
 
     def setUp(self):
         super().setUp()
@@ -745,7 +745,7 @@ class ImportCompilationTest(AutotagImportTestCase):
 
 
 class ImportExistingTest(PathsMixin, AutotagImportTestCase):
-    """ . "说明"Test importing files that are already in the library directory.""" . "说明"
+    """Test importing files that are already in the library directory."""
 
     def setUp(self):
         super().setUp()
@@ -1007,7 +1007,7 @@ class InferAlbumDataTest(unittest.TestCase):
 
 
 def album_candidates_mock(*args, **kwargs):
-    """ . "说明"Create an AlbumInfo object for testing.""" . "说明"
+    """Create an AlbumInfo object for testing."""
     yield AlbumInfo(
         artist="artist",
         album="album",
@@ -1152,7 +1152,7 @@ class TestImportDuplicateAlbum(PluginMixin, ImportHelper):
     "beets.metadata_plugins.candidates", Mock(side_effect=album_candidates_mock)
 )
 class TestImportDuplicateAlbumThreaded(PluginMixin, ImportHelper):
-    """ . "说明"Regression test for #6601: threaded merge must propagate context vars.""" . "说明"
+    """Regression test for #6601: threaded merge must propagate context vars."""
 
     plugin = "musicbrainz"
     # Each thread gets its own connection; :memory: would give each thread an
@@ -1297,12 +1297,12 @@ class TestImportDuplicateSingleton(ImportHelper):
 
 @contextmanager
 def bitrate_overrides(bitrates_by_title):
-    """ . "说明"Force specific per-title bitrates on newly-read import items.
+    """Force specific per-title bitrates on newly-read import items.
 
     The test mp3 fixtures all share one real bitrate, so this patches
     `ImportTaskFactory.read_item` to simulate different-quality
     encodes without needing distinct binary fixtures.
-    """ . "说明"
+    """
     original = ImportTaskFactory.read_item
 
     def patched(self, path):
@@ -1329,9 +1329,9 @@ def test_duplicate_action_prompt_options():
 
 
 class ResolveUpgradeTest(unittest.TestCase):
-    """ . "说明"Unit tests for `resolve_upgrade`, the per-track decision
+    """Unit tests for `resolve_upgrade`, the per-track decision
     algorithm behind `duplicate_action: upgrade`.
-    """ . "说明"
+    """
 
     def _item(self, artist="artist", title="title", bitrate=128000):
         return Item(artist=artist, title=title, bitrate=bitrate)
@@ -1376,8 +1376,8 @@ class ResolveUpgradeTest(unittest.TestCase):
         assert superseded == [old_a]
 
     def test_duplicate_keys_all_old_superseded_when_new_is_best(self):
-        """ . "说明"When multiple old items share a key and the new item beats
-        all of them, every old copy should be superseded.""" . "说明"
+        """When multiple old items share a key and the new item beats
+        all of them, every old copy should be superseded."""
         old_a = self._item(bitrate=128000)
         old_b = self._item(bitrate=96000)
         new = self._item(bitrate=320000)
@@ -1386,8 +1386,8 @@ class ResolveUpgradeTest(unittest.TestCase):
         assert sorted(superseded, key=lambda i: i.bitrate) == [old_b, old_a]
 
     def test_duplicate_keys_rejected_when_new_is_not_best(self):
-        """ . "说明"When an old item with the same key has bitrate >= the new
-        item, the new item should be dropped to prevent a downgrade.""" . "说明"
+        """When an old item with the same key has bitrate >= the new
+        item, the new item should be dropped to prevent a downgrade."""
         old_a = self._item(bitrate=128000)
         old_b = self._item(bitrate=320000)
         new = self._item(bitrate=256000)
@@ -1397,7 +1397,7 @@ class ResolveUpgradeTest(unittest.TestCase):
 
 
 class ResolveUpgradeTargetTest(TestHelper):
-    """ . "说明"Unit tests for `resolve_upgrade_target`: when `found_duplicates`
+    """Unit tests for `resolve_upgrade_target`: when `found_duplicates`
     implicates more than one distinct old album, only the one it
     overlaps with the most should be treated as the upgrade target,
     and every other candidate album must be left untouched.
@@ -1408,7 +1408,7 @@ class ResolveUpgradeTargetTest(TestHelper):
     across every duplicate album could silently attribute a
     supersession to the wrong album (or decline an upgrade that only
     looked bad because of an unrelated album's better copy).
-    """ . "说明"
+    """
 
     def setUp(self):
         self.setup_beets()
@@ -1469,9 +1469,9 @@ class ResolveUpgradeTargetTest(TestHelper):
     "beets.metadata_plugins.candidates", Mock(side_effect=album_candidates_mock)
 )
 class TestImportDuplicateAlbumUpgrade(PluginMixin, ImportHelper):
-    """ . "说明"Album-level `duplicate_action: upgrade`, full track-for-track
+    """Album-level `duplicate_action: upgrade`, full track-for-track
     overlap (the whole album is either replaced or left alone).
-    """ . "说明"
+    """
 
     plugin = "musicbrainz"
 
@@ -1519,12 +1519,12 @@ class TestImportDuplicateAlbumUpgrade(PluginMixin, ImportHelper):
 
 
 class TestImportDuplicateAlbumUpgradeMixed(ImportHelper):
-    """ . "说明"Album-level `duplicate_action: upgrade` where the new import
+    """Album-level `duplicate_action: upgrade` where the new import
     mixes a genuine quality upgrade of one existing track with tracks
     that have no old counterpart at all (e.g. filling in a
     previously-incomplete album). The surviving old tracks and the
     kept new tracks must end up in the same album.
-    """ . "说明"
+    """
 
     def setup_beets(self):
         super().setup_beets()
@@ -1766,12 +1766,12 @@ class AlbumsInDirTest(BeetsTestCase):
 
 class MultiDiscAlbumsInDirTest(BeetsTestCase):
     def create_music(self, files=True, ascii_=True):
-        """ . "说明"Create some music in multiple album directories.
+        """Create some music in multiple album directories.
 
         `files` indicates whether to create the files (otherwise, only
         directories are made). `ascii_` indicates ACII-only filenames;
         otherwise, we use Unicode names.
-        """ . "说明"
+        """
         self.base = (self.temp_path / "tempdir").resolve()
         self.base.mkdir()
 
@@ -1814,9 +1814,9 @@ class MultiDiscAlbumsInDirTest(BeetsTestCase):
         self.base = str(self.base)
 
     def _normalize_path(self, path: Path) -> Path:
-        """ . "说明"Normalize a path's Unicode combining form according to the
+        """Normalize a path's Unicode combining form according to the
         platform.
-        """ . "说明"
+        """
         norm_form: Literal["NFD", "NFC"] = (
             "NFD" if sys.platform == "darwin" else "NFC"
         )
@@ -1924,13 +1924,13 @@ class MultiDiscAlbumsInDirTest(BeetsTestCase):
 
 
 class ReimportTest(AutotagImportTestCase):
-    """ . "说明"Test "re-imports", in which the autotagging machinery is used for
+    """Test "re-imports", in which the autotagging machinery is used for
     music that's already in the library.
 
     This works by importing new database entries for the same files and
     replacing the old data with the new data. We also copy over flexible
     attributes and the added date.
-    """ . "说明"
+    """
 
     matching = AutotagStub.GOOD
 
@@ -2029,7 +2029,7 @@ class ReimportTest(AutotagImportTestCase):
 
 
 class TestImportPretend(ImportHelper):
-    """ . "说明"Test the pretend commandline option.""" . "说明"
+    """Test the pretend commandline option."""
 
     def setup_beets(self):
         super().setup_beets()
@@ -2076,12 +2076,12 @@ class TestImportPretend(ImportHelper):
 
 
 def mocked_get_albums_by_ids(ids):
-    """ . "说明"Return album candidate for the given id.
+    """Return album candidate for the given id.
 
     The two albums differ only in the release title and artist name, so that
     ID_RELEASE_0 is a closer match to the items created by
     ImportHelper.prepare_album_for_import().
-    """ . "说明"
+    """
     # Map IDs to (release title, artist), so the distances are different.
     album_artist_map = {
         TestImportId.ID_RELEASE_0: ("VALID_RELEASE_0", "TAG ARTIST"),
@@ -2111,12 +2111,12 @@ def mocked_get_albums_by_ids(ids):
 
 
 def mocked_get_tracks_by_ids(ids):
-    """ . "说明"Return track candidate for the given id.
+    """Return track candidate for the given id.
 
     The two tracks differ only in the release title and artist name, so that
     ID_RELEASE_0 is a closer match to the items created by
     ImportHelper.prepare_album_for_import().
-    """ . "说明"
+    """
     # Map IDs to (recording title, artist), so the distances are different.
     title_artist_map = {
         TestImportId.ID_RECORDING_0: ("VALID_RECORDING_0", "TAG ARTIST"),
@@ -2185,7 +2185,7 @@ class TestImportId(ImportHelper):
         assert self.lib.items().get().title == "VALID_RECORDING_1"
 
     def test_candidates_album(self):
-        """ . "说明"Test directly ImportTask.lookup_candidates().""" . "说明"
+        """Test directly ImportTask.lookup_candidates()."""
         task = importer.ImportTask(
             paths=os.fsencode(self.import_path),
             toppath="top path",
@@ -2199,7 +2199,7 @@ class TestImportId(ImportHelper):
         }
 
     def test_candidates_singleton(self):
-        """ . "说明"Test directly SingletonImportTask.lookup_candidates().""" . "说明"
+        """Test directly SingletonImportTask.lookup_candidates()."""
         task = importer.SingletonImportTask(
             toppath="top path", item=_common.item()
         )
@@ -2212,7 +2212,7 @@ class TestImportId(ImportHelper):
 
 
 class TestMpeglayerWavImport(AsIsImporterMixin, ImportHelper):
-    """ . "说明"Test remuxing of WAVE_FORMAT_MPEGLAYER3 WAV files.""" . "说明"
+    """Test remuxing of WAVE_FORMAT_MPEGLAYER3 WAV files."""
 
     def test_remux_mpeglayer3_wav(self):
         src = _common.RSRC / "mpeglayer3.wav"
@@ -2227,7 +2227,7 @@ class TestMpeglayerWavImport(AsIsImporterMixin, ImportHelper):
         assert not dest.exists()
 
     def test_remux_mpeglayer3_wav_disabled(self):
-        """ . "说明"When remux_mp3_in_wav is disabled, WAV file should not be remuxed.""" . "说明"
+        """When remux_mp3_in_wav is disabled, WAV file should not be remuxed."""
         self.config["import"]["remux_mp3_in_wav"] = False
         src = _common.RSRC / "mpeglayer3.wav"
         dest = self.import_path / "mpeglayer3.wav"
