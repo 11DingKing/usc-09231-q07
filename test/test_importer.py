@@ -1,7 +1,8 @@
-""" . "说明"Tests for the general importer functionality.""" . "说明"
+"""Tests for the general importer functionality."""
 
 from __future__ import annotations
 
+import importlib.util
 import os
 import re
 import shutil
@@ -23,9 +24,13 @@ import pytest
 from mediafile import MediaFile
 
 from beets import config, importer, logging, util
+from beets.importer import tasks as importer_tasks
 from beets.autotag import AlbumInfo, AlbumMatch, Distance, TrackInfo
 from beets.importer.tasks import (
+    ArchiveImportTask,
     ImportTaskFactory,
+    SevenZipArchive,
+    TarArchive,
     albums_in_dir,
     resolve_upgrade,
     resolve_upgrade_target,
@@ -44,6 +49,7 @@ from beets.test.helper import (
     PluginMixin,
     TestHelper,
     has_program,
+    is_importable,
 )
 from beets.util import bytestring_path, syspath
 from beets.util.extension import remux_mpeglayer3_wav
@@ -162,10 +168,78 @@ def create_archive(session):
     return bytestring_path(path)
 
 
+# Archive formats exercised end-to-end. 7z is only available when the
+# optional py7zr dependency is installed; rar needs the external unrar
+# binary and is covered separately below.
+ARCHIVE_FORMATS = ["zip", "tar"] + (
+    ["7z"] if importlib.util.find_spec("py7zr") is not None else []
+)
+
+
+def build_archive(fmt, dest_dir, members=(), empty=False):
+    """Create an archive of the given format in ``dest_dir``.
+
+    ``members`` is a list of ``(arcname, source_path)`` pairs. The same
+    structure is produced in every format so traversal and cleanup can be
+    compared across them.
+    """
+    handle, path = mkstemp(suffix=f".{fmt}", dir=os.fsdecode(dest_dir))
+    os.close(handle)
+    path = os.fsdecode(path)
+    if fmt == "zip":
+        with ZipFile(path, "w") as archive:
+            for arcname, source in members:
+                archive.write(syspath(source), arcname)
+    elif fmt == "tar":
+        with TarFile.open(path, "w") as archive:
+            for arcname, source in members:
+                archive.add(syspath(source), arcname=arcname)
+    elif fmt == "7z":
+        import py7zr
+
+        with py7zr.SevenZipFile(path, "w") as archive:
+            for arcname, source in members:
+                archive.write(syspath(source), arcname)
+    else:  # pragma: no cover - defensive
+        raise ValueError(f"unknown archive format: {fmt}")
+    assert empty or members
+    return bytestring_path(path)
+
+
+def nested_archive_members():
+    """A multi-disc layout: two (differently-tagged) tracks in nested
+    directories plus album art."""
+    return [
+        ("The Album/disc 1/track 1.mp3", _common.RSRC / "full.mp3"),
+        ("The Album/disc 2/track 2.mp3", _common.RSRC / "min.mp3"),
+        ("The Album/cover.jpg", _common.RSRC / "abbey.jpg"),
+    ]
+
+
+@contextmanager
+def track_extraction_dirs(monkeypatch, base_dir):
+    """Record every temporary extraction directory created during a test.
+
+    The extraction code uses ``tempfile.mkdtemp``; redirect those calls
+    under ``base_dir`` and return the live list of created paths so tests
+    can assert none of them leak.
+    """
+    created: list[str] = []
+    real_mkdtemp = importer_tasks.mkdtemp
+
+    def tracked_mkdtemp(*args, **kwargs):
+        path = real_mkdtemp(*args, dir=os.fsdecode(base_dir), **kwargs)
+        created.append(path)
+        return path
+
+    monkeypatch.setattr(importer_tasks, "mkdtemp", tracked_mkdtemp)
+    yield created
+
+
 class TestRmTemp(TestHelper):
-    """ . "说明"Tests that temporarily extracted archives are properly removed
+    """Tests that temporarily extracted archives are properly removed
     after usage.
-    """ . "说明"
+    """
 
     def setup_beets(self):
         super().setup_beets()
@@ -227,35 +301,328 @@ class TestRmTemp(TestHelper):
                 f"tempdir {tmp_path} not removed for {cleanup_kwargs}"
             )
 
+    @pytest.mark.parametrize("fmt", ARCHIVE_FORMATS)
+    def test_extract_nested_structure_all_formats(self, fmt):
+        archive_path = build_archive(
+            fmt, self.temp_path, nested_archive_members()
+        )
+        task = ArchiveImportTask(archive_path)
+        task.extract()
+        root = Path(os.fsdecode(task.toppath))
+
+        # Every file member -- including those in nested disc directories --
+        # is extracted; directory entries are not mistaken for files.
+        assert (root / "The Album" / "disc 1" / "track 1.mp3").is_file()
+        assert (root / "The Album" / "disc 2" / "track 2.mp3").is_file()
+        assert (root / "The Album" / "cover.jpg").is_file()
+
+        task.cleanup()
+        assert not root.exists()
+
+    @pytest.mark.parametrize("fmt", ARCHIVE_FORMATS)
+    def test_extract_empty_archive(self, fmt):
+        # An archive with no members must extract cleanly rather than
+        # failing while iterating members for mtime restoration.
+        archive_path = build_archive(fmt, self.temp_path, empty=True)
+        task = ArchiveImportTask(archive_path)
+        task.extract()
+        root = Path(os.fsdecode(task.toppath))
+        assert root.is_dir()
+        assert not any(root.rglob("*"))
+        task.cleanup()
+        assert not root.exists()
+
+    @pytest.mark.parametrize("fmt", ARCHIVE_FORMATS)
+    def test_cleanup_without_extract_is_noop(self, fmt):
+        archive_path = build_archive(
+            fmt, self.temp_path, [("full.mp3", _common.RSRC / "full.mp3")]
+        )
+        task = ArchiveImportTask(archive_path)
+        # Must neither remove the source archive nor raise.
+        task.cleanup(move=True)
+        assert Path(os.fsdecode(archive_path)).exists()
+
+
+class TestArchiveFailureRollback(ImportHelper):
+    """A failure during opening/extraction/mtime restoration must roll the
+    temporary extraction directory back and leave the task and the source
+    archive untouched.
+    """
+
+    def setup_beets(self):
+        super().setup_beets()
+        self.config["copy"] = True
+        self.config["move"] = False
+
+    def _tar(self, members=() ):
+        return build_archive(
+            "tar",
+            self.temp_path,
+            members or [("full.mp3", _common.RSRC / "full.mp3")],
+        )
+
+    @staticmethod
+    def _patch_opener(monkeypatch, wrap):
+        """Replace the registered tar opener with ``wrap`` and force the
+        cached handler list to rebuild so the patch takes effect.
+        """
+        original_open = TarArchive.open
+        monkeypatch.setattr(
+            TarArchive, "open", staticmethod(wrap(original_open))
+        )
+        util.cached_classproperty.cache.pop(
+            (ArchiveImportTask, "handlers"), None
+        )
+
+    def test_tempdir_removed_when_extractall_fails(self, monkeypatch):
+        archive_path = self._tar()
+
+        def wrap(original_open):
+            def failing_open(*args, **kwargs):
+                archive = original_open(*args, **kwargs)
+
+                def fail(_path):
+                    raise OSError("simulated extraction failure")
+
+                archive.extractall = fail
+                return archive
+
+            return failing_open
+
+        with track_extraction_dirs(monkeypatch, self.temp_path) as created:
+            self._patch_opener(monkeypatch, wrap)
+            task = ArchiveImportTask(archive_path)
+            with pytest.raises(OSError, match="simulated extraction"):
+                task.extract()
+
+            assert created, "no extraction directory was created"
+            assert all(not os.path.exists(d) for d in created)
+        # The task never committed, so the source is preserved and the task
+        # still points at the original archive.
+        assert Path(os.fsdecode(archive_path)).exists()
+        assert task.extracted is False
+        assert task.toppath == archive_path
+
+    def test_tempdir_removed_when_member_iteration_fails(self, monkeypatch):
+        archive_path = self._tar()
+
+        def wrap(original_open):
+            def failing_open(*args, **kwargs):
+                archive = original_open(*args, **kwargs)
+
+                def fail():
+                    raise RuntimeError("simulated member iteration failure")
+
+                archive.infolist = fail
+                return archive
+
+            return failing_open
+
+        with track_extraction_dirs(monkeypatch, self.temp_path) as created:
+            self._patch_opener(monkeypatch, wrap)
+            task = ArchiveImportTask(archive_path)
+            with pytest.raises(RuntimeError, match="member iteration"):
+                task.extract()
+
+            assert all(not os.path.exists(d) for d in created)
+        assert task.extracted is False
+        assert task.toppath == archive_path
+
+    def test_failed_open_leaves_no_tempdir_behind(self, monkeypatch):
+        # Reproduces the original leak: mkdtemp() ran before the failing
+        # archive calls, and the directory was never reclaimed. Here the
+        # opener itself raises (as it would for an unreadable archive).
+        archive_path = self._tar(nested_archive_members())
+
+        def wrap(_original_open):
+            def fail(*_args, **_kwargs):
+                raise OSError("cannot open")
+
+            return fail
+
+        with track_extraction_dirs(monkeypatch, self.temp_path) as created:
+            self._patch_opener(monkeypatch, wrap)
+            with pytest.raises(OSError, match="cannot open"):
+                ArchiveImportTask(archive_path).extract()
+            assert created and all(not os.path.exists(d) for d in created)
+
+    def test_factory_unarchive_failure_leaks_nothing(self, monkeypatch):
+        # The factory swallows extraction errors (logging and returning
+        # None instead of a task); even so, the temp directory must be
+        # reclaimed rather than orphaned. Drive a genuine failure after
+        # mkdtemp() by making extractall raise through the opener.
+        session = self.setup_importer(autotag=False, import_dir=self.temp_path)
+        session.set_config(config["import"])
+        archive_path = self._tar()
+
+        def wrap(original_open):
+            def failing_open(*args, **kwargs):
+                archive = original_open(*args, **kwargs)
+                archive.extractall = lambda _path: (_ for _ in ()).throw(
+                    OSError("boom")
+                )
+                return archive
+
+            return failing_open
+
+        with track_extraction_dirs(monkeypatch, self.temp_path) as created:
+            self._patch_opener(monkeypatch, wrap)
+            factory = ImportTaskFactory(archive_path, session)
+            assert factory.unarchive() is None
+            assert created and all(not os.path.exists(d) for d in created)
+
+
+class TestArchiveMissingDependency(TestHelper):
+    """Optional formats degrade to a clear "unsupported" error rather than
+    an opaque AttributeError, and never register half-working handlers.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _sevenz_fixture(self, monkeypatch):
+        # Force ``import py7zr`` to fail as if the package were absent and
+        # discard the class-level handler cache so it rebuilds without 7z.
+        monkeypatch.setitem(sys.modules, "py7zr", None)
+        util.cached_classproperty.cache.pop(
+            (ArchiveImportTask, "handlers"), None
+        )
+        yield
+
+    def test_7z_not_recognised_without_py7zr(self):
+        archive = _common.RSRC / "archive.7z"
+        assert not ArchiveImportTask.is_archive(syspath(archive))
+        assert all(
+            opener is not SevenZipArchive
+            for _, opener in ArchiveImportTask.handlers
+        )
+
+    def test_extract_7z_without_py7zr_raises_clear_error(self):
+        archive = bytestring_path(_common.RSRC / "archive.7z")
+        task = ArchiveImportTask(archive)
+        with pytest.raises(ValueError, match="No handler found"):
+            task.extract()
+        assert task.extracted is False
+
+    def test_rar_requires_rarfile(self, monkeypatch):
+        monkeypatch.setitem(sys.modules, "rarfile", None)
+        util.cached_classproperty.cache.pop(
+            (ArchiveImportTask, "handlers"), None
+        )
+        archive = bytestring_path(_common.RSRC / "archive.rar")
+        assert not ArchiveImportTask.is_archive(os.fsdecode(archive))
+        with pytest.raises(ValueError, match="No handler found"):
+            ArchiveImportTask(archive).extract()
+
+
+class TestImportArchiveStructure(AsIsImporterMixin, ImportHelper):
+    """End-to-end: the same nested layout is imported correctly through
+    every supported format, and the temporary extraction directory is
+    reclaimed by the trailing archive sentinel.
+    """
+
+    @pytest.mark.parametrize("fmt", ARCHIVE_FORMATS)
+    def test_nested_archive_imports_all_members(self, fmt):
+        archive_path = build_archive(
+            fmt, self.temp_path, nested_archive_members()
+        )
+        assert len(self.lib.items()) == 0
+
+        self.run_asis_importer(import_dir=archive_path)
+
+        # Both audio tracks are imported (the jpeg is ignored as
+        # non-music) and neither member is dropped by traversal.
+        assert len(self.lib.items()) == 2
+        assert "full" in [i.title for i in self.lib.items()]
+        for item in self.lib.items():
+            assert item.filepath.exists()
+
+    @pytest.mark.parametrize("fmt", ARCHIVE_FORMATS)
+    def test_archive_task_is_emitted_last(self, fmt):
+        # The cleanup contract depends on ordering: all music tasks must be
+        # yielded before the ArchiveImportTask sentinel that removes the
+        # extraction directory.
+        archive_path = build_archive(
+            fmt, self.temp_path, nested_archive_members()
+        )
+        session = self.setup_importer(autotag=False, import_dir=archive_path)
+        session.set_config(config["import"])
+        factory = ImportTaskFactory(archive_path, session)
+
+        tasks = list(factory.tasks())
+        assert isinstance(tasks[-1], ArchiveImportTask)
+        assert any(
+            isinstance(t, importer.ImportTask)
+            and not isinstance(t, importer.SentinelImportTask)
+            for t in tasks[:-1]
+        )
+
+    @pytest.mark.parametrize("fmt", ARCHIVE_FORMATS)
+    def test_empty_archive_imports_nothing_and_cleans_up(self, fmt):
+        archive_path = build_archive(fmt, self.temp_path, empty=True)
+        self.run_asis_importer(import_dir=archive_path)
+        assert len(self.lib.items()) == 0
+
+    @pytest.mark.parametrize("fmt", ARCHIVE_FORMATS)
+    def test_move_completely_imported_archive_removes_source(self, fmt):
+        archive_path = build_archive(
+            fmt, self.temp_path, [("full.mp3", _common.RSRC / "full.mp3")]
+        )
+        self.run_asis_importer(import_dir=archive_path, move=True)
+        assert len(self.lib.items()) == 1
+        assert not Path(os.fsdecode(archive_path)).exists()
+
+    @pytest.mark.parametrize("fmt", ARCHIVE_FORMATS)
+    def test_partial_move_keeps_archive_and_cleans_tempdir(
+        self, fmt, monkeypatch
+    ):
+        # A non-audio member survives the import (it is never moved), so the
+        # archive is only partially consumed and must be preserved while the
+        # extraction directory is still removed.
+        archive_path = build_archive(
+            fmt,
+            self.temp_path,
+            [
+                ("full.mp3", _common.RSRC / "full.mp3"),
+                ("notes.txt", _common.RSRC / "abbey.jpg"),
+            ],
+        )
+        with track_extraction_dirs(monkeypatch, self.temp_path) as created:
+            self.run_asis_importer(import_dir=archive_path, move=True)
+        assert len(self.lib.items()) == 1
+        assert Path(os.fsdecode(archive_path)).exists()
+        assert all(not os.path.exists(d) for d in created)
+
 
 class TestImportZip(AsIsImporterMixin, ImportHelper):
+    def create_archive(self):
+        return create_archive(self)
+
     def test_import_zip(self):
-        zip_path = create_archive(self)
+        archive_path = self.create_archive()
         assert len(self.lib.items()) == 0
         assert len(self.lib.albums()) == 0
 
-        self.run_asis_importer(import_dir=zip_path)
+        self.run_asis_importer(import_dir=archive_path)
         assert len(self.lib.items()) == 1
         assert len(self.lib.albums()) == 1
 
 
 class TestImportTar(TestImportZip):
     def create_archive(self):
-        (handle, path) = mkstemp(dir=self.temp_path)
-        path = bytestring_path(path)
-        os.close(handle)
-        archive = TarFile(os.fsdecode(path), mode="w")
-        archive.add(_common.RSRC / "full.mp3", "full.mp3")
-        archive.close()
-        return path
+        return build_archive(
+            "tar", self.temp_path, [("full.mp3", _common.RSRC / "full.mp3")]
+        )
 
 
-@pytest.mark.skipif(not has_program("unrar"), reason="unrar program not found")
+@pytest.mark.skipif(
+    not (is_importable("rarfile") and has_program("unrar")),
+    reason="rarfile or unrar program not found",
+)
 class TestImportRar(TestImportZip):
     def create_archive(self):
         return _common.RSRC / "archive.rar"
 
 
+@pytest.mark.skipif(not is_importable("py7zr"), reason="py7zr is not available")
 class TestImport7z(TestImportZip):
     def create_archive(self):
         return _common.RSRC / "archive.7z"
@@ -267,10 +634,11 @@ class TestImportPasswordRar(TestImportZip):
         return _common.RSRC / "password.rar"
 
 
+
 class ImportSingletonTest(AutotagImportTestCase):
-    """ . "说明"Test ``APPLY`` and ``ASIS`` choices for an import session with
+    """Test ``APPLY`` and ``ASIS`` choices for an import session with
     singletons config set to True.
-    """ . "说明"
+    """
 
     def setUp(self):
         super().setUp()
@@ -381,7 +749,7 @@ class ImportSingletonTest(AutotagImportTestCase):
     reason="need ffprobe for format recognition",
 )
 class TestImportFormat(ImportHelper):
-    """ . "说明"Test fix_extension during import.""" . "说明"
+    """Test fix_extension during import."""
 
     def test_recognize_format(self):
         resource_src = _common.RSRC / "no_ext"
@@ -437,7 +805,7 @@ class TestImportFormat(ImportHelper):
 
 
 class TestImport(PathsMixin, AutotagImportHelper):
-    """ . "说明"Test APPLY, ASIS and SKIP choices.""" . "说明"
+    """Test APPLY, ASIS and SKIP choices."""
 
     def setup_beets(self):
         super().setup_beets()
@@ -614,7 +982,7 @@ class TestImport(PathsMixin, AutotagImportHelper):
 
 
 class ImportTracksTest(AutotagImportTestCase):
-    """ . "说明"Test TRACKS and APPLY choice.""" . "说明"
+    """Test TRACKS and APPLY choice."""
 
     def setUp(self):
         super().setUp()
@@ -640,7 +1008,7 @@ class ImportTracksTest(AutotagImportTestCase):
 
 
 class ImportCompilationTest(AutotagImportTestCase):
-    """ . "说明"Test ASIS import of a folder containing tracks with different artists.""" . "说明"
+    """Test ASIS import of a folder containing tracks with different artists."""
 
     def setUp(self):
         super().setUp()
@@ -745,7 +1113,7 @@ class ImportCompilationTest(AutotagImportTestCase):
 
 
 class ImportExistingTest(PathsMixin, AutotagImportTestCase):
-    """ . "说明"Test importing files that are already in the library directory.""" . "说明"
+    """Test importing files that are already in the library directory."""
 
     def setUp(self):
         super().setUp()
@@ -1007,7 +1375,7 @@ class InferAlbumDataTest(unittest.TestCase):
 
 
 def album_candidates_mock(*args, **kwargs):
-    """ . "说明"Create an AlbumInfo object for testing.""" . "说明"
+    """Create an AlbumInfo object for testing."""
     yield AlbumInfo(
         artist="artist",
         album="album",
@@ -1152,7 +1520,7 @@ class TestImportDuplicateAlbum(PluginMixin, ImportHelper):
     "beets.metadata_plugins.candidates", Mock(side_effect=album_candidates_mock)
 )
 class TestImportDuplicateAlbumThreaded(PluginMixin, ImportHelper):
-    """ . "说明"Regression test for #6601: threaded merge must propagate context vars.""" . "说明"
+    """Regression test for #6601: threaded merge must propagate context vars."""
 
     plugin = "musicbrainz"
     # Each thread gets its own connection; :memory: would give each thread an
@@ -1297,12 +1665,12 @@ class TestImportDuplicateSingleton(ImportHelper):
 
 @contextmanager
 def bitrate_overrides(bitrates_by_title):
-    """ . "说明"Force specific per-title bitrates on newly-read import items.
+    """Force specific per-title bitrates on newly-read import items.
 
     The test mp3 fixtures all share one real bitrate, so this patches
     `ImportTaskFactory.read_item` to simulate different-quality
     encodes without needing distinct binary fixtures.
-    """ . "说明"
+    """
     original = ImportTaskFactory.read_item
 
     def patched(self, path):
@@ -1329,9 +1697,9 @@ def test_duplicate_action_prompt_options():
 
 
 class ResolveUpgradeTest(unittest.TestCase):
-    """ . "说明"Unit tests for `resolve_upgrade`, the per-track decision
+    """Unit tests for `resolve_upgrade`, the per-track decision
     algorithm behind `duplicate_action: upgrade`.
-    """ . "说明"
+    """
 
     def _item(self, artist="artist", title="title", bitrate=128000):
         return Item(artist=artist, title=title, bitrate=bitrate)
@@ -1376,8 +1744,8 @@ class ResolveUpgradeTest(unittest.TestCase):
         assert superseded == [old_a]
 
     def test_duplicate_keys_all_old_superseded_when_new_is_best(self):
-        """ . "说明"When multiple old items share a key and the new item beats
-        all of them, every old copy should be superseded.""" . "说明"
+        """When multiple old items share a key and the new item beats
+        all of them, every old copy should be superseded."""
         old_a = self._item(bitrate=128000)
         old_b = self._item(bitrate=96000)
         new = self._item(bitrate=320000)
@@ -1386,8 +1754,8 @@ class ResolveUpgradeTest(unittest.TestCase):
         assert sorted(superseded, key=lambda i: i.bitrate) == [old_b, old_a]
 
     def test_duplicate_keys_rejected_when_new_is_not_best(self):
-        """ . "说明"When an old item with the same key has bitrate >= the new
-        item, the new item should be dropped to prevent a downgrade.""" . "说明"
+        """When an old item with the same key has bitrate >= the new
+        item, the new item should be dropped to prevent a downgrade."""
         old_a = self._item(bitrate=128000)
         old_b = self._item(bitrate=320000)
         new = self._item(bitrate=256000)
@@ -1397,7 +1765,7 @@ class ResolveUpgradeTest(unittest.TestCase):
 
 
 class ResolveUpgradeTargetTest(TestHelper):
-    """ . "说明"Unit tests for `resolve_upgrade_target`: when `found_duplicates`
+    """Unit tests for `resolve_upgrade_target`: when `found_duplicates`
     implicates more than one distinct old album, only the one it
     overlaps with the most should be treated as the upgrade target,
     and every other candidate album must be left untouched.
@@ -1408,7 +1776,7 @@ class ResolveUpgradeTargetTest(TestHelper):
     across every duplicate album could silently attribute a
     supersession to the wrong album (or decline an upgrade that only
     looked bad because of an unrelated album's better copy).
-    """ . "说明"
+    """
 
     def setUp(self):
         self.setup_beets()
@@ -1469,9 +1837,9 @@ class ResolveUpgradeTargetTest(TestHelper):
     "beets.metadata_plugins.candidates", Mock(side_effect=album_candidates_mock)
 )
 class TestImportDuplicateAlbumUpgrade(PluginMixin, ImportHelper):
-    """ . "说明"Album-level `duplicate_action: upgrade`, full track-for-track
+    """Album-level `duplicate_action: upgrade`, full track-for-track
     overlap (the whole album is either replaced or left alone).
-    """ . "说明"
+    """
 
     plugin = "musicbrainz"
 
@@ -1519,12 +1887,12 @@ class TestImportDuplicateAlbumUpgrade(PluginMixin, ImportHelper):
 
 
 class TestImportDuplicateAlbumUpgradeMixed(ImportHelper):
-    """ . "说明"Album-level `duplicate_action: upgrade` where the new import
+    """Album-level `duplicate_action: upgrade` where the new import
     mixes a genuine quality upgrade of one existing track with tracks
     that have no old counterpart at all (e.g. filling in a
     previously-incomplete album). The surviving old tracks and the
     kept new tracks must end up in the same album.
-    """ . "说明"
+    """
 
     def setup_beets(self):
         super().setup_beets()
@@ -1766,12 +2134,12 @@ class AlbumsInDirTest(BeetsTestCase):
 
 class MultiDiscAlbumsInDirTest(BeetsTestCase):
     def create_music(self, files=True, ascii_=True):
-        """ . "说明"Create some music in multiple album directories.
+        """Create some music in multiple album directories.
 
         `files` indicates whether to create the files (otherwise, only
         directories are made). `ascii_` indicates ACII-only filenames;
         otherwise, we use Unicode names.
-        """ . "说明"
+        """
         self.base = (self.temp_path / "tempdir").resolve()
         self.base.mkdir()
 
@@ -1814,9 +2182,9 @@ class MultiDiscAlbumsInDirTest(BeetsTestCase):
         self.base = str(self.base)
 
     def _normalize_path(self, path: Path) -> Path:
-        """ . "说明"Normalize a path's Unicode combining form according to the
+        """Normalize a path's Unicode combining form according to the
         platform.
-        """ . "说明"
+        """
         norm_form: Literal["NFD", "NFC"] = (
             "NFD" if sys.platform == "darwin" else "NFC"
         )
@@ -1924,13 +2292,13 @@ class MultiDiscAlbumsInDirTest(BeetsTestCase):
 
 
 class ReimportTest(AutotagImportTestCase):
-    """ . "说明"Test "re-imports", in which the autotagging machinery is used for
+    """Test "re-imports", in which the autotagging machinery is used for
     music that's already in the library.
 
     This works by importing new database entries for the same files and
     replacing the old data with the new data. We also copy over flexible
     attributes and the added date.
-    """ . "说明"
+    """
 
     matching = AutotagStub.GOOD
 
@@ -2029,7 +2397,7 @@ class ReimportTest(AutotagImportTestCase):
 
 
 class TestImportPretend(ImportHelper):
-    """ . "说明"Test the pretend commandline option.""" . "说明"
+    """Test the pretend commandline option."""
 
     def setup_beets(self):
         super().setup_beets()
@@ -2076,12 +2444,12 @@ class TestImportPretend(ImportHelper):
 
 
 def mocked_get_albums_by_ids(ids):
-    """ . "说明"Return album candidate for the given id.
+    """Return album candidate for the given id.
 
     The two albums differ only in the release title and artist name, so that
     ID_RELEASE_0 is a closer match to the items created by
     ImportHelper.prepare_album_for_import().
-    """ . "说明"
+    """
     # Map IDs to (release title, artist), so the distances are different.
     album_artist_map = {
         TestImportId.ID_RELEASE_0: ("VALID_RELEASE_0", "TAG ARTIST"),
@@ -2111,12 +2479,12 @@ def mocked_get_albums_by_ids(ids):
 
 
 def mocked_get_tracks_by_ids(ids):
-    """ . "说明"Return track candidate for the given id.
+    """Return track candidate for the given id.
 
     The two tracks differ only in the release title and artist name, so that
     ID_RELEASE_0 is a closer match to the items created by
     ImportHelper.prepare_album_for_import().
-    """ . "说明"
+    """
     # Map IDs to (recording title, artist), so the distances are different.
     title_artist_map = {
         TestImportId.ID_RECORDING_0: ("VALID_RECORDING_0", "TAG ARTIST"),
@@ -2185,7 +2553,7 @@ class TestImportId(ImportHelper):
         assert self.lib.items().get().title == "VALID_RECORDING_1"
 
     def test_candidates_album(self):
-        """ . "说明"Test directly ImportTask.lookup_candidates().""" . "说明"
+        """Test directly ImportTask.lookup_candidates()."""
         task = importer.ImportTask(
             paths=os.fsencode(self.import_path),
             toppath="top path",
@@ -2199,7 +2567,7 @@ class TestImportId(ImportHelper):
         }
 
     def test_candidates_singleton(self):
-        """ . "说明"Test directly SingletonImportTask.lookup_candidates().""" . "说明"
+        """Test directly SingletonImportTask.lookup_candidates()."""
         task = importer.SingletonImportTask(
             toppath="top path", item=_common.item()
         )
@@ -2212,7 +2580,7 @@ class TestImportId(ImportHelper):
 
 
 class TestMpeglayerWavImport(AsIsImporterMixin, ImportHelper):
-    """ . "说明"Test remuxing of WAVE_FORMAT_MPEGLAYER3 WAV files.""" . "说明"
+    """Test remuxing of WAVE_FORMAT_MPEGLAYER3 WAV files."""
 
     def test_remux_mpeglayer3_wav(self):
         src = _common.RSRC / "mpeglayer3.wav"
@@ -2227,7 +2595,7 @@ class TestMpeglayerWavImport(AsIsImporterMixin, ImportHelper):
         assert not dest.exists()
 
     def test_remux_mpeglayer3_wav_disabled(self):
-        """ . "说明"When remux_mp3_in_wav is disabled, WAV file should not be remuxed.""" . "说明"
+        """When remux_mp3_in_wav is disabled, WAV file should not be remuxed."""
         self.config["import"]["remux_mp3_in_wav"] = False
         src = _common.RSRC / "mpeglayer3.wav"
         dest = self.import_path / "mpeglayer3.wav"

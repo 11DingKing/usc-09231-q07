@@ -4,12 +4,14 @@ import logging
 import os
 import re
 import shutil
+import tarfile
 import time
 from collections import defaultdict
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
 from functools import cached_property
 from tempfile import mkdtemp
-from typing import TYPE_CHECKING, Any, AnyStr
+from typing import TYPE_CHECKING, Any, AnyStr, Protocol, cast
 
 import mediafile
 
@@ -65,11 +67,11 @@ log = logging.getLogger("beets")
 
 
 class ImportAbortError(Exception):
-    """ . "说明"Raised when the user aborts the tagging operation.""" . "说明"
+    """Raised when the user aborts the tagging operation."""
 
 
 def _item_dup_key(item: library.Item, keys: list[str]) -> tuple[Any, ...]:
-    """ . "说明"Identity key for matching a track across old/new copies.
+    """Identity key for matching a track across old/new copies.
 
     Uses the same `duplicate_keys.item` fields that duplicate
     *detection* already relies on (`ImportTask.find_duplicates` /
@@ -78,12 +80,12 @@ def _item_dup_key(item: library.Item, keys: list[str]) -> tuple[Any, ...]:
     `mb_trackid` is deliberately not preferred here: a re-ripped
     duplicate commonly gets matched to a different MusicBrainz track
     ID than the old copy, which would otherwise cause false negatives.
-    """ . "说明"
+    """
     return tuple(item.get(k) for k in keys)
 
 
 def _dup_items(obj: library.Album | library.Item) -> list[library.Item]:
-    """ . "说明"Flatten a found-duplicate (`Album` or `Item`) into its items.""" . "说明"
+    """Flatten a found-duplicate (`Album` or `Item`) into its items."""
     if isinstance(obj, library.Album):
         return list(obj.items())
     return [obj]
@@ -94,7 +96,7 @@ def resolve_upgrade(
     old_items: list[library.Item],
     keys: list[str],
 ) -> tuple[list[library.Item], list[library.Item]]:
-    """ . "说明"Decide, per track, which new items to keep and which old items
+    """Decide, per track, which new items to keep and which old items
     they supersede.
 
     Returns `(kept_new_items, superseded_old_items)`. New items with no
@@ -104,7 +106,7 @@ def resolve_upgrade(
     otherwise they're dropped and the old items are left untouched.
     When multiple old items share a key, all of them are superseded
     when the new item is better.
-    """ . "说明"
+    """
     by_key: dict[tuple[Any, ...], list[library.Item]] = defaultdict(list)
     for item in old_items:
         by_key[_item_dup_key(item, keys)].append(item)
@@ -126,7 +128,7 @@ def resolve_upgrade_target(
     found_duplicates: Iterable[library.Album | library.Item],
     keys: list[str],
 ) -> tuple[list[library.Item], list[library.Item], list[int]]:
-    """ . "说明"Resolve an upgrade against each duplicate album independently
+    """Resolve an upgrade against each duplicate album independently
     and pick a single target to graft the result into.
 
     A new item can only ever join one physical album, so when
@@ -144,7 +146,7 @@ def resolve_upgrade_target(
 
     Returns `(kept, superseded, old_album_ids)` for the chosen target
     album alone.
-    """ . "说明"
+    """
     best_rank: tuple[int, int, int] | None = None
     best: tuple[list[library.Item], list[library.Item], int | None] = (
         [],
@@ -165,10 +167,10 @@ def resolve_upgrade_target(
 
 
 class BaseImportTask:
-    """ . "说明"An abstract base class for importer tasks.
+    """An abstract base class for importer tasks.
 
     Tasks flow through the importer pipeline. Each stage can update
-    them.""" . "说明"
+    them."""
 
     toppath: util.PathBytes | None
     paths: list[util.PathBytes]
@@ -180,7 +182,7 @@ class BaseImportTask:
         paths: Iterable[util.PathBytes] | None,
         items: Iterable[library.Item] | None,
     ) -> None:
-        """ . "说明"Create a task. The primary fields that define a task are:
+        """Create a task. The primary fields that define a task are:
 
         * `toppath`: The user-specified base directory that contains the
           music for this task. If the task has *no* user-specified base
@@ -195,14 +197,14 @@ class BaseImportTask:
           imported.
 
         These fields should not change after initialization.
-        """ . "说明"
+        """
         self.toppath = toppath
         self.paths = list(paths) if paths is not None else []
         self.items = list(items) if items is not None else []
 
 
 class ImportTask(BaseImportTask):
-    """ . "说明"Represents a single set of items to be imported along with its
+    """Represents a single set of items to be imported along with its
     intermediate state. May represent an album or a single item.
 
     The import session and stages call the following methods in the
@@ -231,7 +233,7 @@ class ImportTask(BaseImportTask):
 
     * `finalize()` Update the import progress and cleanup the file
       system.
-    """ . "说明"
+    """
 
     choice_flag: Action | None = None
     match: AlbumMatch | TrackMatch | None = None
@@ -264,12 +266,12 @@ class ImportTask(BaseImportTask):
         self.is_album = True
 
     def set_choice(self, choice: Action | AlbumMatch | TrackMatch) -> None:
-        """ . "说明"Given an AlbumMatch or TrackMatch object or an action constant,
+        """Given an AlbumMatch or TrackMatch object or an action constant,
         indicates that an action has been selected for this task.
 
         Album and trackmatch are implemented as tuples, so we can't
         use isinstance to check for them.
-        """ . "说明"
+        """
         # Not part of the task structure:
         assert choice != Action.APPLY  # Only used internally.
 
@@ -288,14 +290,14 @@ class ImportTask(BaseImportTask):
             self.match = choice  # type: ignore[assignment]
 
     def save_progress(self) -> None:
-        """ . "说明"Updates the progress state to indicate that this album has
+        """Updates the progress state to indicate that this album has
         finished.
-        """ . "说明"
+        """
         if self.toppath:
             ImportState().progress_add(self.toppath, *self.paths)
 
     def save_history(self) -> None:
-        """ . "说明"Save the directory in the history for incremental imports.""" . "说明"
+        """Save the directory in the history for incremental imports."""
         ImportState().history_add(self.paths)
 
     # Logical decisions.
@@ -314,11 +316,11 @@ class ImportTask(BaseImportTask):
     # Convenient data.
 
     def chosen_info(self) -> dict[str, Any]:
-        """ . "说明"Return a dictionary of metadata about the current choice.
+        """Return a dictionary of metadata about the current choice.
         May only be called when the choice flag is ASIS or RETAG
         (in which case the data comes from the files' current metadata)
         or APPLY (in which case the data comes from the choice).
-        """ . "说明"
+        """
         if self.choice_flag in (Action.ASIS, Action.RETAG):
             return self.source.data.copy()
         if self.choice_flag is Action.APPLY and self.match:
@@ -326,11 +328,11 @@ class ImportTask(BaseImportTask):
         assert False
 
     def imported_items(self) -> list[library.Item]:
-        """ . "说明"Return a list of Items that should be added to the library.
+        """Return a list of Items that should be added to the library.
 
         If the tasks applies an album match the method only returns the
         matched items.
-        """ . "说明"
+        """
         if self.choice_flag in (Action.ASIS, Action.RETAG):
             return self.items
         if self.choice_flag == Action.APPLY and isinstance(
@@ -345,14 +347,14 @@ class ImportTask(BaseImportTask):
         superseded: list[library.Item],
         old_album_ids: list[int],
     ) -> None:
-        """ . "说明"Narrow this task's items down to `kept`, so `add()` only
+        """Narrow this task's items down to `kept`, so `add()` only
         commits tracks that improve on (or have no) existing duplicate.
 
         Called by `_resolve_duplicates`, before `add()` runs, when
         `duplicate_action` is UPGRADE. Stashes `superseded` and
         `old_album_ids` for `remove_duplicates` to consume later, once
         `self.album` exists.
-        """ . "说明"
+        """
         kept_ids = {id(i) for i in kept}
         if self.choice_flag in (Action.ASIS, Action.RETAG):
             self.items = kept
@@ -368,7 +370,7 @@ class ImportTask(BaseImportTask):
         self._upgrade_old_albums = old_album_ids
 
     def apply_metadata(self) -> None:
-        """ . "说明"Copy metadata from match info to the items.""" . "说明"
+        """Copy metadata from match info to the items."""
         if self.match:  # TODO: redesign to remove the conditional
             self.match.apply_metadata()
 
@@ -412,7 +414,7 @@ class ImportTask(BaseImportTask):
                 )
 
     def _remove_upgrade_duplicates(self, lib: library.Library) -> None:
-        """ . "说明"Remove only the old items superseded by an upgrade.
+        """Remove only the old items superseded by an upgrade.
 
         Unlike plain `remove`, this never deletes tracks that weren't
         actually replaced: if any of an old duplicate album's items
@@ -420,7 +422,7 @@ class ImportTask(BaseImportTask):
         the album stays as one row) instead of being left in the
         fresh album `add()` created for them. Only when an old album
         is left with no surviving items is it deleted outright.
-        """ . "说明"
+        """
         superseded = self._upgrade_superseded or []
         log.debug("upgrade: removing {} superseded item(s)", len(superseded))
         for item in superseded:
@@ -467,9 +469,9 @@ class ImportTask(BaseImportTask):
             # arbitrarily choosing between two candidates.
 
     def set_fields(self, lib: library.Library) -> None:
-        """ . "说明"Sets the fields given at CLI or configuration to the specified
+        """Sets the fields given at CLI or configuration to the specified
         values, for both the album and all its items.
-        """ . "说明"
+        """
         items = self.imported_items()
         for field, view in config["import"]["set_fields"].items():
             value = str(view.get())
@@ -488,7 +490,7 @@ class ImportTask(BaseImportTask):
             self.album.store()
 
     def finalize(self, session: ImportSession) -> None:
-        """ . "说明"Save progress, clean up files, and emit plugin event.""" . "说明"
+        """Save progress, clean up files, and emit plugin event."""
         # Update progress.
         if session.want_resume:
             self.save_progress()
@@ -510,7 +512,7 @@ class ImportTask(BaseImportTask):
     def cleanup(
         self, copy: bool = False, delete: bool = False, move: bool = False
     ) -> None:
-        """ . "说明"Remove and prune imported paths.""" . "说明"
+        """Remove and prune imported paths."""
         # Do not delete any files or prune directories when skipping.
         if self.skip:
             return
@@ -535,11 +537,11 @@ class ImportTask(BaseImportTask):
         plugins.send("album_imported", lib=lib, album=self.album)
 
     def handle_created(self, session: ImportSession) -> list[ImportTask]:
-        """ . "说明"Send the `import_task_created` event for this task. Return a list of
+        """Send the `import_task_created` event for this task. Return a list of
         tasks that should continue through the pipeline. By default, this is a
         list containing only the task itself, but plugins can replace the task
         with new ones.
-        """ . "说明"
+        """
         plugin_tasks = plugins.send(
             "import_task_created", session=session, task=self
         )
@@ -550,19 +552,19 @@ class ImportTask(BaseImportTask):
         return [t for inner in plugin_tasks for t in inner]
 
     def lookup_candidates(self, search_ids: list[str]) -> None:
-        """ . "说明"Retrieve and store candidates for this album.
+        """Retrieve and store candidates for this album.
 
         If User-specified ``search_ids`` list is not empty, the lookup is
         restricted to only those IDs.
-        """ . "说明"
+        """
         self.candidates, self.rec = tag_album(
             self.source, search_ids=search_ids
         )
 
     def find_duplicates(self, lib: library.Library) -> list[library.Album]:
-        """ . "说明"Return a list of albums from `lib` with the same artist and
+        """Return a list of albums from `lib` with the same artist and
         album name as the task.
-        """ . "说明"
+        """
         info = self.chosen_info()
         info["albumartist"] = info["artist"]
 
@@ -593,11 +595,11 @@ class ImportTask(BaseImportTask):
         return duplicates
 
     def align_album_level_fields(self) -> None:
-        """ . "说明"Make some album fields equal across `self.items`. For the
+        """Make some album fields equal across `self.items`. For the
         RETAG action, we assume that the responsible for returning it
         (ie. a plugin) always ensures that the first item contains
         valid data on the relevant fields.
-        """ . "说明"
+        """
         changes = {}
 
         if self.choice_flag == Action.ASIS:
@@ -642,14 +644,14 @@ class ImportTask(BaseImportTask):
         operation: util.MoveOperation | None = None,
         write: bool = False,
     ) -> None:
-        """ . "说明"Copy, move, link, hardlink or reflink (depending on `operation`)
+        """Copy, move, link, hardlink or reflink (depending on `operation`)
         the files as well as write metadata.
 
         `operation` should be an instance of `util.MoveOperation`.
 
         If `write` is `True` metadata is written to the files.
         # TODO: Introduce a MoveOperation.NONE or SKIP
-        """ . "说明"
+        """
 
         items = self.imported_items()
         # Save the original paths of all items for deletion and pruning
@@ -685,7 +687,7 @@ class ImportTask(BaseImportTask):
         plugins.send("import_task_files", session=session, task=self)
 
     def add(self, lib: library.Library) -> None:
-        """ . "说明"Add the items as an album to the library and remove replaced items.""" . "说明"
+        """Add the items as an album to the library and remove replaced items."""
         self.align_album_level_fields()
         with lib.transaction():
             self.record_replaced(lib)
@@ -705,9 +707,9 @@ class ImportTask(BaseImportTask):
             self.reimport_metadata(lib)
 
     def record_replaced(self, lib: library.Library) -> None:
-        """ . "说明"Records the replaced items and albums in the `replaced_items`
+        """Records the replaced items and albums in the `replaced_items`
         and `replaced_albums` dictionaries.
-        """ . "说明"
+        """
         self.replaced_items = defaultdict(list)
         self.replaced_albums: dict[util.PathBytes, library.Album] = (
             defaultdict()
@@ -728,20 +730,20 @@ class ImportTask(BaseImportTask):
                     self.replaced_albums[replaced_album.path] = replaced_album
 
     def reimport_metadata(self, lib: library.Library) -> None:
-        """ . "说明"For reimports, preserves metadata for reimported items and
+        """For reimports, preserves metadata for reimported items and
         albums.
-        """ . "说明"
+        """
 
         def _reduce_and_log(
             new_obj: library.LibModel,
             existing_fields: Mapping[str, Any],
             overwrite_keys: list[str],
         ) -> Mapping[str, Any]:
-            """ . "说明"Some flexible attributes should be overwritten (rather than
+            """Some flexible attributes should be overwritten (rather than
             preserved) on reimports; Copies existing_fields, logs and removes
             entries that should not be preserved and returns a dict containing
             those fields left to actually be preserved.
-            """ . "说明"
+            """
             noun = "album" if isinstance(new_obj, library.Album) else "item"
             existing_fields = dict(existing_fields)
             overwritten_fields = [
@@ -810,9 +812,9 @@ class ImportTask(BaseImportTask):
                 item.store()
 
     def remove_replaced(self, lib: library.Library) -> None:
-        """ . "说明"Removes all the items from the library that have the same
+        """Removes all the items from the library that have the same
         path as an item from this task.
-        """ . "说明"
+        """
         for item in self.imported_items():
             for dup_item in self.replaced_items[item]:
                 log.debug("Replacing item {.id}: {.filepath}", dup_item, item)
@@ -824,13 +826,13 @@ class ImportTask(BaseImportTask):
         )
 
     def choose_match(self, session: ImportSession) -> None:
-        """ . "说明"Ask the session which match should apply and apply it.""" . "说明"
+        """Ask the session which match should apply and apply it."""
         choice = session.choose_match(self)
         self.set_choice(choice)
         session.log_choice(self)
 
     def reload(self) -> None:
-        """ . "说明"Reload albums and items from the database.""" . "说明"
+        """Reload albums and items from the database."""
         for item in self.imported_items():
             item.load()
         self.album.load()
@@ -838,12 +840,12 @@ class ImportTask(BaseImportTask):
     # Utilities.
 
     def prune(self, filename: util.PathBytes) -> None:
-        """ . "说明"Prune any empty directories above the given file. If this
+        """Prune any empty directories above the given file. If this
         task has no `toppath` or the file path provided is not within
         the `toppath`, then this function has no effect. Similarly, if
         the file still exists, no pruning is performed, so it's safe to
         call when the file in question may not have been removed.
-        """ . "说明"
+        """
         if self.toppath and not os.path.exists(util.syspath(filename)):
             util.prune_dirs(
                 os.path.dirname(os.fsdecode(filename)),
@@ -853,7 +855,7 @@ class ImportTask(BaseImportTask):
 
 
 class SingletonImportTask(ImportTask):
-    """ . "说明"ImportTask for a single track that is not associated to an album.""" . "说明"
+    """ImportTask for a single track that is not associated to an album."""
 
     @cached_property
     def source(self) -> Source:
@@ -876,7 +878,7 @@ class SingletonImportTask(ImportTask):
         superseded: list[library.Item],
         old_album_ids: list[int],
     ) -> None:
-        """ . "说明"Stash the superseded old item for `remove_duplicates`.
+        """Stash the superseded old item for `remove_duplicates`.
 
         `kept` is always `[self.item]` here: a singleton task has
         exactly one item, and the caller only invokes this method when
@@ -885,7 +887,7 @@ class SingletonImportTask(ImportTask):
         singleton duplicate detection to other singletons (items with
         no album), so a matched duplicate never has an old album to
         preserve.
-        """ . "说明"
+        """
         self._upgrade_superseded = superseded
 
     def _emit_imported(self, lib: library.Library) -> None:
@@ -896,9 +898,9 @@ class SingletonImportTask(ImportTask):
         self.candidates, self.rec = tag_item(self.source, search_ids=search_ids)
 
     def find_duplicates(self, lib: library.Library) -> list[library.Item]:  # type: ignore[override] # Need splitting Singleton and Album tasks into separate classes
-        """ . "说明"Return a list of items from `lib` that have the same artist
+        """Return a list of items from `lib` that have the same artist
         and title as the task.
-        """ . "说明"
+        """
         info = self.chosen_info()
 
         # Query for existing items using the same metadata. We use a
@@ -937,12 +939,12 @@ class SingletonImportTask(ImportTask):
                 )
 
     def _remove_upgrade_duplicates(self, lib: library.Library) -> None:
-        """ . "说明"Remove the superseded old item(s).
+        """Remove the superseded old item(s).
 
         Singleton duplicate detection only ever matches other
         singletons (see `find_duplicates`), so there's never an old
         album to preserve here, unlike the `ImportTask` version.
-        """ . "说明"
+        """
         superseded = self._upgrade_superseded or []
         log.debug("upgrade: removing {} superseded item(s)", len(superseded))
         for item in superseded:
@@ -967,7 +969,7 @@ class SingletonImportTask(ImportTask):
         raise NotImplementedError
 
     def choose_match(self, session: ImportSession) -> None:
-        """ . "说明"Ask the session which match should apply and apply it.""" . "说明"
+        """Ask the session which match should apply and apply it."""
         choice = session.choose_item(self)
         self.set_choice(choice)
         session.log_choice(self)
@@ -976,9 +978,9 @@ class SingletonImportTask(ImportTask):
         self.item.load()
 
     def set_fields(self, lib: library.Library) -> None:
-        """ . "说明"Sets the fields given at CLI or configuration to the specified
+        """Sets the fields given at CLI or configuration to the specified
         values, for the singleton item.
-        """ . "说明"
+        """
         for field, view in config["import"]["set_fields"].items():
             value = str(view.get())
             log.debug(
@@ -995,13 +997,13 @@ class SingletonImportTask(ImportTask):
 # are so many methods which pass. More responsibility should be delegated to
 # the BaseImportTask class.
 class SentinelImportTask(ImportTask):
-    """ . "说明"A sentinel task marks the progress of an import and does not
+    """A sentinel task marks the progress of an import and does not
     import any items itself.
 
     If only `toppath` is set the task indicates the end of a top-level
     directory import. If the `paths` argument is also given, the task
     indicates the progress in the `toppath` import.
-    """ . "说明"
+    """
 
     def __init__(
         self,
@@ -1040,11 +1042,111 @@ class SentinelImportTask(ImportTask):
         pass
 
 
-ArchiveHandler = tuple[Callable[[util.StrPath], bool], Callable[..., Any]]
+class ArchiveMember(Protocol):
+    """The subset of ``zipfile.ZipInfo`` that extraction reads from each
+    (file) member of an archive.
+
+    Declared with read-only properties so the protocol stays covariant: a
+    member exposing a narrower ``date_time`` (such as ``ZipInfo``'s
+    six-int tuple) still conforms.
+    """
+
+    @property
+    def filename(self) -> str: ...
+
+    @property
+    def date_time(self) -> tuple[int, ...]: ...
+
+
+class Archive(Protocol):
+    """The uniform interface every archive handler must expose.
+
+    ``zipfile.ZipFile`` and ``rarfile.RarFile`` already provide it; tar and
+    7z are adapted to it below so :meth:`ArchiveImportTask.extract` never
+    has to specialise on the concrete format.
+    """
+
+    def extractall(self, path: util.StrPath) -> None: ...
+
+    def infolist(self) -> Sequence[ArchiveMember]: ...
+
+    def close(self) -> None: ...
+
+
+ArchiveOpener = Callable[..., Archive]
+ArchiveHandler = tuple[Callable[[util.StrPath], bool], ArchiveOpener]
+
+
+class _TarMemberInfo:
+    """Adapt a ``tarfile.TarInfo`` file entry to `ArchiveMember`."""
+
+    def __init__(self, member: tarfile.TarInfo) -> None:
+        self.filename = member.name
+        self.date_time = time.gmtime(member.mtime)[:6]
+
+
+class TarArchive(tarfile.TarFile):
+    """``tarfile.TarFile`` extended with ``infolist`` to mirror
+    ``zipfile.ZipFile``, so member iteration is uniform across handlers.
+
+    Only regular files are returned. Extraction resets mtimes to preserve
+    the imported files' timestamps; directory (and special) entries carry no
+    file mtime worth restoring, so excluding them keeps the member list equal
+    to the files actually walked on disk.
+    """
+
+    @classmethod
+    def open(cls, *args: Any, **kwargs: Any) -> TarArchive:
+        # ``TarFile.open`` instantiates ``cls`` at runtime, so this really
+        # returns a ``TarArchive``; typeshed types it as the base ``TarFile``
+        # (which lacks ``infolist``), so narrow it back here.
+        return cast(TarArchive, super().open(*args, **kwargs))
+
+    def infolist(self) -> list[_TarMemberInfo]:
+        return [
+            _TarMemberInfo(m) for m in self.getmembers() if m.isfile()
+        ]
+
+
+class _SevenZipMemberInfo:
+    """Adapt a ``py7zr`` file-info entry to `ArchiveMember`."""
+
+    def __init__(self, member: Any) -> None:
+        self.filename = member.filename
+        self.date_time = member.creationtime.timetuple()[:6]
+
+
+class SevenZipArchive:
+    """Adapt ``py7zr.SevenZipFile`` to the `Archive` interface.
+
+    ``SevenZipFile`` exposes ``list()`` rather than ``infolist()`` and takes
+    ``extractall(path=...)`` rather than a positional argument, so a thin
+    adapter is required. Composition (rather than subclassing) keeps the
+    optional ``py7zr`` dependency lazy: it is imported only when a 7z
+    archive is actually opened.
+    """
+
+    def __init__(self, path: util.StrPath, mode: str = "r") -> None:
+        import py7zr
+
+        self._archive = py7zr.SevenZipFile(path, mode=mode)
+
+    def extractall(self, path: util.StrPath) -> None:
+        self._archive.extractall(path=path)
+
+    def infolist(self) -> list[_SevenZipMemberInfo]:
+        return [
+            _SevenZipMemberInfo(m)
+            for m in self._archive.list()
+            if m.is_file
+        ]
+
+    def close(self) -> None:
+        self._archive.close()
 
 
 class ArchiveImportTask(SentinelImportTask):
-    """ . "说明"An import task that represents the processing of an archive.
+    """An import task that represents the processing of an archive.
 
     `toppath` must be a `zip`, `tar`, `rar`, or `7z` archive. Archive tasks
     serve three purposes:
@@ -1058,7 +1160,7 @@ class ArchiveImportTask(SentinelImportTask):
       archive was successfully imported, it will remove the source
       archive itself. Archives are preserved on partial imports and in
       non-move modes.
-    """ . "说明"
+    """
 
     toppath: util.PathBytes
 
@@ -1072,9 +1174,9 @@ class ArchiveImportTask(SentinelImportTask):
 
     @classmethod
     def is_archive(cls, path: str) -> bool:
-        """ . "说明"Returns true if the given path points to an archive that can
+        """Returns true if the given path points to an archive that can
         be handled.
-        """ . "说明"
+        """
         if not os.path.isfile(path):
             return False
 
@@ -1083,22 +1185,42 @@ class ArchiveImportTask(SentinelImportTask):
                 return True
         return False
 
+    @classmethod
+    def _resolve_handler(
+        cls, path: util.StrPath
+    ) -> tuple[Callable[[util.StrPath], bool], ArchiveOpener]:
+        """Return the registered ``(test, opener)`` pair that accepts path.
+
+        Raises ``ValueError`` with a clear message when no registered
+        handler recognises the file -- including an optional format
+        (rar/7z) whose supporting package is not installed, in which case
+        the format's test function was never registered.
+        """
+        for path_test, opener in cls.handlers:
+            if path_test(path):
+                return path_test, opener
+        raise ValueError(
+            f"No handler found for archive: {util.displayable_path(path)}. "
+            "Supported formats are zip and tar; rar and 7z additionally "
+            "require the rarfile and py7zr packages, respectively."
+        )
+
     @util.cached_classproperty
     def handlers(cls) -> list[ArchiveHandler]:
-        """ . "说明"Returns a list of archive handlers.
+        """Returns a list of archive handlers.
 
-        Each handler is a `(path_test, ArchiveClass)` tuple. `path_test`
-        is a function that returns `True` if the given path can be
-        handled by `ArchiveClass`. `ArchiveClass` is a class that
-        implements the same interface as `tarfile.TarFile`.
-        """ . "说明"
-        _handlers: list[ArchiveHandler] = []
+        Each handler is a `(path_test, opener)` tuple. `path_test` returns
+        `True` when the path is in the handler's format, and `opener` opens
+        the archive and returns an object conforming to the `Archive`
+        protocol (`extractall`/`infolist`/`close`). Handlers for the
+        optional ``rarfile`` and ``py7zr`` dependencies are registered only
+        when those packages are importable, so a missing dependency simply
+        leaves its format unsupported rather than failing at import time.
+        """
         from zipfile import ZipFile, is_zipfile
 
-        _handlers.append((is_zipfile, ZipFile))
-        import tarfile
-
-        _handlers.append((tarfile.is_tarfile, tarfile.open))
+        _handlers: list[ArchiveHandler] = [(is_zipfile, ZipFile)]
+        _handlers.append((tarfile.is_tarfile, TarArchive.open))
         try:
             from rarfile import RarFile, is_rarfile
         except ImportError:
@@ -1106,36 +1228,57 @@ class ArchiveImportTask(SentinelImportTask):
         else:
             _handlers.append((is_rarfile, RarFile))
         try:
-            from py7zr import SevenZipFile, is_7zfile
+            from py7zr import is_7zfile
         except ImportError:
             pass
         else:
-            _handlers.append((is_7zfile, SevenZipFile))
+            _handlers.append((is_7zfile, SevenZipArchive))
 
         return _handlers
+
+    @staticmethod
+    @contextmanager
+    def _extraction_dir() -> Iterator[util.PathBytes]:
+        """Yield a fresh temporary directory with rollback-on-failure cleanup.
+
+        If the ``with`` body raises, the directory is removed so a failed
+        extraction can never leave an extracted tree behind. If the body
+        completes normally, ownership of the directory is handed to the
+        caller (which is expected to commit it via ``self.toppath`` and
+        remove it later in ``cleanup``), so it is left in place.
+        """
+        extract_to = mkdtemp()
+        try:
+            yield os.fsencode(extract_to)
+        except BaseException:
+            shutil.rmtree(extract_to, ignore_errors=True)
+            raise
 
     def cleanup(
         self, copy: bool = False, delete: bool = False, move: bool = False
     ) -> None:
-        """ . "说明"Remove the temporary extraction directory and optionally the archive.
+        """Remove the temporary extraction directory and optionally the archive.
 
         In ``move`` mode, if the extraction directory is empty after the
         pipeline has run (i.e. every file in the archive was successfully
         imported) also remove the source archive. Archives are preserved on
         partial imports and in non-move modes.
-        """ . "说明"
+        """
         if not self.extracted:
             return
 
+        extract_dir = util.syspath(self.toppath)
         all_files_imported = move and not any(
-            files for _, _, files in os.walk(util.syspath(self.toppath))
+            files for _, _, files in os.walk(extract_dir)
         )
 
         log.debug(
             "Removing extracted directory: {}",
             util.displayable_path(self.toppath),
         )
-        shutil.rmtree(util.syspath(self.toppath))
+        # ``ignore_errors`` keeps cleanup best-effort, matching ``util.remove``
+        # semantics; a leftover extraction dir must not abort the pipeline.
+        shutil.rmtree(extract_dir, ignore_errors=True)
 
         if all_files_imported:
             log.debug(
@@ -1150,53 +1293,58 @@ class ArchiveImportTask(SentinelImportTask):
             )
 
     def extract(self) -> None:
-        """ . "说明"Extracts the archive to a temporary directory and sets
-        `toppath` to that directory.
-        """ . "说明"
+        """Extract the archive into a temporary directory.
+
+        On success `toppath` is set to that directory and ownership of it
+        is handed to ``cleanup`` (which runs when the task traverses the
+        pipeline). If opening, extracting, or restoring mtimes fails, the
+        temporary directory is removed, `toppath` keeps pointing at the
+        original archive, and the exception propagates to the caller.
+        """
         assert self.toppath is not None, "toppath must be set"
+        archive_path = os.fsdecode(self.toppath)
+        _, opener = self._resolve_handler(archive_path)
 
-        for path_test, handler_class in self.handlers:
-            if path_test(os.fsdecode(self.toppath)):
-                break
-        else:
-            raise ValueError(
-                f"No handler found for archive: {util.displayable_path(self.toppath)}"
-            )
-        extract_to = mkdtemp()
-        archive = handler_class(os.fsdecode(self.toppath), mode="r")
-        try:
-            archive.extractall(extract_to)
+        with self._extraction_dir() as extract_to_bytes:
+            extract_to = os.fsdecode(extract_to_bytes)
+            archive = opener(archive_path, mode="r")
+            try:
+                archive.extractall(extract_to)
 
-            # Adjust the files' mtimes to match the information from the
-            # archive. Inspired by: https://stackoverflow.com/q/9813243
-            for f in archive.infolist():
-                # The date_time will need to adjusted otherwise
-                # the item will have the current date_time of extraction.
-                # The (0, 0, -1) is added to date_time because the
-                # function time.mktime expects a 9-element tuple.
-                # The -1 indicates that the DST flag is unknown.
-                date_time = time.mktime((*f.date_time, 0, 0, -1))
-                fullpath = os.path.join(extract_to, f.filename)
-                os.utime(fullpath, (date_time, date_time))
+                # Adjust the files' mtimes to match the information from the
+                # archive. Inspired by: https://stackoverflow.com/q/9813243
+                for f in archive.infolist():
+                    # date_time is (year, month, day, hour, minute, second);
+                    # the trailing (0, 0, -1) pads it to the nine-element
+                    # tuple time.mktime expects. The -1 means the DST flag
+                    # is unknown.
+                    year, month, day, hour, minute, second = f.date_time
+                    date_time = time.mktime(
+                        (year, month, day, hour, minute, second, 0, 0, -1)
+                    )
+                    fullpath = os.path.join(extract_to, f.filename)
+                    os.utime(fullpath, (date_time, date_time))
+            finally:
+                archive.close()
 
-        finally:
-            archive.close()
-        self.extracted = True
-        self.toppath = os.fsencode(extract_to)
+            # Commit only after every step above succeeded: the context
+            # manager must not remove the directory the task now owns.
+            self.extracted = True
+            self.toppath = extract_to_bytes
 
 
 class ImportTaskFactory:
-    """ . "说明"Generate album and singleton import tasks for all media files
+    """Generate album and singleton import tasks for all media files
     indicated by a path.
-    """ . "说明"
+    """
 
     def __init__(self, toppath: util.PathBytes, session: ImportSession) -> None:
-        """ . "说明"Create a new task factory.
+        """Create a new task factory.
 
         `toppath` is the user-specified path to search for music to
         import. `session` is the `ImportSession`, which controls how
         tasks are read from the directory.
-        """ . "说明"
+        """
         self.toppath = toppath
         self.session = session
         self.skipped = 0  # Skipped due to incremental/resume.
@@ -1204,7 +1352,7 @@ class ImportTaskFactory:
         self.is_archive = ArchiveImportTask.is_archive(util.syspath(toppath))
 
     def tasks(self) -> Iterable[ImportTask]:
-        """ . "说明"Yield all import tasks for music found in the user-specified
+        """Yield all import tasks for music found in the user-specified
         path `self.toppath`. Any necessary sentinel tasks are also
         produced.
 
@@ -1215,7 +1363,7 @@ class ImportTaskFactory:
 
         If `self.toppath` is an archive, it is adjusted to point to the
         extracted data.
-        """ . "说明"
+        """
         # Check whether this is an archive.
         archive_task: ArchiveImportTask | None = None
         if self.is_archive:
@@ -1242,12 +1390,12 @@ class ImportTaskFactory:
         yield archive_task or self.sentinel()
 
     def _create(self, task: ImportTask | None) -> list[ImportTask]:
-        """ . "说明"Handle a new task to be emitted by the factory.
+        """Handle a new task to be emitted by the factory.
 
         Emit the `import_task_created` event and increment the
         `imported` count if the task is not skipped. Return the same
         task. If `task` is None, do nothing.
-        """ . "说明"
+        """
         if task:
             tasks = task.handle_created(self.session)
             self.imported += len(tasks)
@@ -1257,14 +1405,14 @@ class ImportTaskFactory:
     def paths(
         self,
     ) -> Iterable[tuple[list[util.PathBytes], list[util.PathBytes]]]:
-        """ . "说明"Walk `self.toppath` and yield `(dirs, files)` pairs where
+        """Walk `self.toppath` and yield `(dirs, files)` pairs where
         `files` are individual music files and `dirs` the set of
         containing directories where the music was found.
 
         This can either be a recursive search in the ordinary case, a
         single track when `toppath` is a file, a single directory in
         `flat` mode.
-        """ . "说明"
+        """
         if not os.path.isdir(util.syspath(self.toppath)):
             yield [self.toppath], [self.toppath]
         elif self.session.config["flat"]:
@@ -1277,7 +1425,7 @@ class ImportTaskFactory:
                 yield dirs, paths
 
     def singleton(self, path: util.PathBytes) -> SingletonImportTask | None:
-        """ . "说明"Return a `SingletonImportTask` for the music file.""" . "说明"
+        """Return a `SingletonImportTask` for the music file."""
         if self.session.already_imported(self.toppath, [path]):
             log.debug(
                 "Skipping previously-imported path: {}",
@@ -1294,11 +1442,11 @@ class ImportTaskFactory:
     def album(
         self, paths: Iterable[util.PathBytes], dirs: list[util.PathBytes]
     ) -> ImportTask | None:
-        """ . "说明"Return a `ImportTask` with all media files from paths.
+        """Return a `ImportTask` with all media files from paths.
 
         `dirs` is a list of parent directories used to record already
         imported albums.
-        """ . "说明"
+        """
         if self.session.already_imported(self.toppath, dirs):
             log.debug(
                 "Skipping previously-imported path: {}",
@@ -1318,18 +1466,18 @@ class ImportTaskFactory:
     def sentinel(
         self, paths: Iterable[util.PathBytes] | None = None
     ) -> SentinelImportTask:
-        """ . "说明"Return a `SentinelImportTask` indicating the end of a
+        """Return a `SentinelImportTask` indicating the end of a
         top-level directory import.
-        """ . "说明"
+        """
         return SentinelImportTask(self.toppath, paths)
 
     def unarchive(self) -> ArchiveImportTask | None:
-        """ . "说明"Extract the archive for this `toppath`.
+        """Extract the archive for this `toppath`.
 
         Extract the archive to a new directory, adjust `toppath` to
         point to the extracted directory, and return an
         `ArchiveImportTask`. If extraction fails, return None.
-        """ . "说明"
+        """
         assert self.is_archive
 
         if not (self.session.config["move"] or self.session.config["copy"]):
@@ -1353,11 +1501,11 @@ class ImportTaskFactory:
         return archive_task
 
     def read_item(self, path: util.PathBytes) -> library.Item | None:
-        """ . "说明"Return an `Item` read from the path.
+        """Return an `Item` read from the path.
 
         If an item cannot be read, return `None` instead and log an
         error.
-        """ . "说明"
+        """
 
         # Check if the file has an extension,
         # Add an extension if there isn't one.
@@ -1401,19 +1549,19 @@ MULTIDISC_PATTERNS = [
 
 
 def is_subdir_of_any_in_list(path: AnyStr, dirs: list[AnyStr]) -> bool:
-    """ . "说明"Returns True if path os a subdirectory of any directory in dirs
+    """Returns True if path os a subdirectory of any directory in dirs
     (a list). In other case, returns False.
-    """ . "说明"
+    """
     ancestors = util.ancestry(path)
     return any(d in ancestors for d in dirs)
 
 
 def albums_in_dir(path: AnyStr) -> Iterable[tuple[list[AnyStr], list[AnyStr]]]:
-    """ . "说明"Recursively searches the given directory and returns an iterable
+    """Recursively searches the given directory and returns an iterable
     of (paths, items) where paths is a list of directories and items is
     a list of Items that is probably an album. Specifically, any folder
     containing any media files is an album.
-    """ . "说明"
+    """
     collapse_paths: list[AnyStr] = []
     collapse_items: list[AnyStr] = []
     collapse_pat = None
